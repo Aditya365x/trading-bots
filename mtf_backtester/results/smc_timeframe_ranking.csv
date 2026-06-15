@@ -1,0 +1,5 @@
+timeframe,trades,win_rate,profit_factor,sharpe_naive,max_drawdown_pct,total_return_pct
+1h,902,0.572,1.85,1.31,-18.1,2390.11
+4h,248,0.512,1.79,1.43,-9.14,161.75
+15m,128,0.492,0.75,-0.12,-20.25,-18.57
+5m,59,0.356,0.39,-0.14,-20.14,-20.14

@@ -1,0 +1,210 @@
+//@version=6
+// =============================================================================
+// SMC BOS + FVG strategy  (Pine port of smc_strategy_adi.py)
+//   Swing pivots -> Break-of-Structure bias -> Fair-Value-Gap retrace entry
+//   ATR-buffered stop, breakeven at +1R, ATR trailing, 2R target
+//   1% fixed-fractional sizing + leverage cap + circuit breakers
+//
+// NOTE ON FILLS: TradingView fills market orders at the NEXT bar's open, while
+// the Python backtester fills intrabar at min(open, fvg_top). Results will
+// therefore differ somewhat from the Python numbers — this reproduces the
+// LOGIC, not the exact execution. Commission below bundles the 5bps fee + 3bps
+// slippage per side from the Python config.
+// =============================================================================
+strategy("SMC BOS + FVG (ADI)", overlay=true, initial_capital=10000,
+     currency=currency.USD, pyramiding=0,
+     commission_type=strategy.commission.percent, commission_value=0.08,
+     calc_on_order_fills=false, process_orders_on_close=false)
+
+// ---- inputs: structure / signal ----
+swingLeft   = input.int(3,  "Swing left",  group="Structure")
+swingRight  = input.int(3,  "Swing right", group="Structure")
+fvgMaxAge   = input.int(30, "FVG max age (bars)", group="Structure")
+requireBias = input.bool(true, "Only take FVGs aligned with bias", group="Structure")
+
+// ---- inputs: risk per trade ----
+riskPct    = input.float(1.0, "Risk per trade %", group="Risk") / 100.0
+maxLev     = input.float(5.0, "Max leverage",     group="Risk")
+minStopAtr = input.float(0.5, "Min stop (ATR)",   group="Risk")
+atrLen     = input.int(14,    "ATR period",       group="Risk")
+atrStopBuf = input.float(0.5, "ATR stop buffer",  group="Risk")
+rewardMult = input.float(2.0, "Reward multiple (R)", group="Risk")
+beAtR      = input.float(1.0, "Move to breakeven at R", group="Risk")
+useTrail   = input.bool(true, "Use ATR trailing", group="Risk")
+trailMult  = input.float(2.0, "ATR trail mult",   group="Risk")
+
+// ---- inputs: circuit breakers ----
+maxDailyLoss  = input.float(3.0,  "Max daily loss %", group="Circuit breakers") / 100.0
+maxDD         = input.float(20.0, "Max drawdown %",   group="Circuit breakers") / 100.0
+maxConsecLoss = input.int(4,      "Max consecutive losses", group="Circuit breakers")
+lockoutBars   = input.int(12,     "Lockout bars",     group="Circuit breakers")
+
+// ---- ATR (SMA of true range, to match the Python rolling-mean ATR) ----
+atrVal = ta.sma(ta.tr(true), atrLen)
+
+// =============================================================================
+// 1) MARKET STRUCTURE  ->  BIAS
+// =============================================================================
+ph = ta.pivothigh(high, swingLeft, swingRight)   // confirmed swingRight bars late
+pl = ta.pivotlow(low,  swingLeft, swingRight)
+
+var float lastSH = na
+var float lastSL = na
+if not na(ph)
+    lastSH := ph
+if not na(pl)
+    lastSL := pl
+
+var int bias = 0
+if not na(lastSH) and close > lastSH
+    bias  := 1            // Break of Structure up
+    lastSH := na          // consume the level
+if not na(lastSL) and close < lastSL
+    bias  := -1
+    lastSL := na
+
+// =============================================================================
+// 2) FAIR VALUE GAPS  (stored as parallel arrays of active zones)
+// =============================================================================
+var array<float> fvgTop  = array.new_float()
+var array<float> fvgBot  = array.new_float()
+var array<int>   fvgDir  = array.new_int()
+var array<int>   fvgBorn = array.new_int()
+
+// bullish FVG: current low above the high two bars back
+if low > high[2] and (not requireBias or bias == 1)
+    array.push(fvgTop,  low)
+    array.push(fvgBot,  high[2])
+    array.push(fvgDir,  1)
+    array.push(fvgBorn, bar_index)
+// bearish FVG: current high below the low two bars back
+if high < low[2] and (not requireBias or bias == -1)
+    array.push(fvgTop,  low[2])
+    array.push(fvgBot,  high)
+    array.push(fvgDir,  -1)
+    array.push(fvgBorn, bar_index)
+
+// prune zones older than fvgMaxAge (iterate backwards so removal is safe)
+if array.size(fvgBorn) > 0
+    for k = array.size(fvgBorn) - 1 to 0
+        if bar_index - array.get(fvgBorn, k) > fvgMaxAge
+            array.remove(fvgTop,  k)
+            array.remove(fvgBot,  k)
+            array.remove(fvgDir,  k)
+            array.remove(fvgBorn, k)
+
+// =============================================================================
+// 3) CIRCUIT BREAKERS  (account-level "what if it goes wrong" protection)
+// =============================================================================
+var float peakEq     = strategy.initial_capital
+var float dayStartEq = strategy.initial_capital
+var bool  halted     = false
+var int   consecLoss = 0
+var int   lockoutUntil = -1
+
+peakEq := math.max(peakEq, strategy.equity)
+if ta.change(time("1D")) != 0
+    dayStartEq := strategy.equity
+if strategy.equity <= peakEq * (1 - maxDD)
+    halted := true                              // permanent halt, matches Python
+
+// detect a just-closed trade and track consecutive losses
+if strategy.closedtrades != strategy.closedtrades[1]
+    lastPnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    if lastPnl < 0
+        consecLoss += 1
+        if consecLoss >= maxConsecLoss
+            lockoutUntil := bar_index + lockoutBars
+            consecLoss := 0
+    else
+        consecLoss := 0
+
+dailyBlocked = strategy.equity <= dayStartEq * (1 - maxDailyLoss)
+locked       = bar_index < lockoutUntil
+canOpen      = not halted and not dailyBlocked and not locked
+
+// =============================================================================
+// 4) MANAGE OPEN TRADE  (breakeven + ATR trail; stop & 2R target via exit)
+// =============================================================================
+var float gEntry  = na
+var float gRisk   = na
+var float gTarget = na
+var float gStop   = na
+var bool  gBeMoved = false
+
+if strategy.position_size != 0
+    dirNow = strategy.position_size > 0 ? 1 : -1
+    uR = dirNow * (close - gEntry) / gRisk
+    if not gBeMoved and uR >= beAtR
+        gStop := gEntry
+        gBeMoved := true
+    if useTrail and uR >= beAtR
+        trail = close - dirNow * trailMult * atrVal
+        gStop := dirNow == 1 ? math.max(gStop, trail) : math.min(gStop, trail)
+    if dirNow == 1
+        strategy.exit("xL", from_entry="L", stop=gStop, limit=gTarget)
+    else
+        strategy.exit("xS", from_entry="S", stop=gStop, limit=gTarget)
+
+// =============================================================================
+// 5 ENTRIES  (first FVG zone aligned with bias that price retraces into)
+// =============================================================================
+canEnter = strategy.position_size == 0 and canOpen and not na(atrVal) and atrVal > 0
+entryIdx = -1
+float ePx = na
+float sPx = na
+int   eDir = 0
+
+if canEnter and array.size(fvgDir) > 0
+    for k = 0 to array.size(fvgDir) - 1
+        if entryIdx == -1
+            zd = array.get(fvgDir, k)
+            if zd == bias
+                zt = array.get(fvgTop, k)
+                zb = array.get(fvgBot, k)
+                if zd == 1 and low <= zt                    // long retrace into gap
+                    e = math.min(open, zt)
+                    s = math.min(zb - atrStopBuf * atrVal, e - minStopAtr * atrVal)
+                    if s < e
+                        entryIdx := k
+                        ePx := e
+                        sPx := s
+                        eDir := 1
+                else if zd == -1 and high >= zb             // short retrace into gap
+                    e = math.max(open, zb)
+                    s = math.max(zt + atrStopBuf * atrVal, e + minStopAtr * atrVal)
+                    if s > e
+                        entryIdx := k
+                        ePx := e
+                        sPx := s
+                        eDir := -1
+
+if entryIdx >= 0
+    riskCash = strategy.equity * riskPct
+    perUnit  = math.abs(ePx - sPx)
+    qty = perUnit > 0 ? riskCash / perUnit : 0.0
+    maxQty = ePx > 0 ? strategy.equity * maxLev / ePx : 0.0
+    qty := math.min(qty, maxQty)
+    if qty > 0
+        gEntry   := ePx
+        gRisk    := perUnit
+        gTarget  := ePx + eDir * rewardMult * perUnit
+        gStop    := sPx
+        gBeMoved := false
+        if eDir == 1
+            strategy.entry("L", strategy.long, qty=qty)
+        else
+            strategy.entry("S", strategy.short, qty=qty)
+    // consume the zone on signal (matches Python)
+    array.remove(fvgTop,  entryIdx)
+    array.remove(fvgBot,  entryIdx)
+    array.remove(fvgDir,  entryIdx)
+    array.remove(fvgBorn, entryIdx)
+
+// =============================================================================
+// 6) VISUALS
+// =============================================================================
+bgcolor(bias == 1 ? color.new(color.green, 92) : bias == -1 ? color.new(color.red, 92) : na, title="Bias")
+plot(strategy.position_size != 0 ? gStop   : na, "Stop",   color.red,   2, plot.style_linebr)
+plot(strategy.position_size != 0 ? gTarget : na, "Target", color.green, 2, plot.style_linebr)
+plot(strategy.position_size != 0 ? gEntry  : na, "Entry",  color.gray,  1, plot.style_linebr)

@@ -1,0 +1,74 @@
+//@version=5
+strategy("Prop Firm Hyper-Robust Risk Engine", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// ==========================================
+//   PROP FIRM CONFIGURATION (INPUTS)
+// ==========================================
+maxDailyLossPct = input.float(4.0, title="Max Daily Loss Limit (%)", minval=0.1, maxval=10.0) / 100
+riskPerTradePct = input.float(1.0, title="Risk Per Trade (%)", minval=0.1, maxval=5.0) / 100
+
+// Strategy Parameters
+emaLength      = input.int(200, title="Trend Filter (EMA)")
+adxThreshold   = input.int(21, title="Min ADX for Trend")
+hardStopPct    = 0.015  // 1.5% Hard Stop
+trailActivate  = 0.015  // 1.5% Profit to activate trailing
+trailOffset    = 0.005  // 0.5% Trailing distance
+
+// ==========================================
+//   DAILY CIRCUIT BREAKER LOGIC
+// ==========================================
+// Track equity at the start of each new session/day
+var float stageDailyStartEquity = na
+if ta.change(time("D")) or na(stageDailyStartEquity)
+    stageDailyStartEquity := strategy.equity
+
+// Calculate total current loss for the day (closed PnL today + open floating PnL)
+currentDailyLoss = stageDailyStartEquity - strategy.equity
+maxDailyLossAllowed = stageDailyStartEquity * maxDailyLossPct
+
+dailyLossBreached = currentDailyLoss >= maxDailyLossAllowed
+
+// Display circuit breaker status visually on your chart
+plotshape(dailyLossBreached, title="Daily Limit Breached", location=location.top, color=color.red, style=shape.labeldown, text="CIRCUIT BREAKER: LOCKED")
+
+// ==========================================
+//   INDICATORS & SIGNALS
+// ==========================================
+mainEma = ta.ema(close, emaLength)
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+[macdLine, signalLine, _] = ta.macd(close, 12, 26, 9)
+
+isTrending  = adx > adxThreshold
+inUptrend   = close > mainEma
+inDowntrend = close < mainEma
+
+buyCondition  = inUptrend and isTrending and ta.crossover(macdLine, signalLine) and not dailyLossBreached
+sellCondition = inDowntrend and isTrending and ta.crossunder(macdLine, signalLine) and not dailyLossBreached
+
+// ==========================================
+//   DYNAMIC POSITION SIZING & EXECUTION
+// ==========================================
+// Automatically calculates how many contracts to buy so you only lose EXACTLY 1% of equity if stopped out
+stopLossDistancePrice = close * hardStopPct
+contractsToTrade = (strategy.equity * riskPerTradePct) / stopLossDistancePrice
+
+// Convert ticks for exit logic
+stopLossTicks      = math.round(stopLossDistancePrice / syminfo.mintick)
+trailActivationTicks = math.round((close * trailActivate) / syminfo.mintick)
+trailOffsetTicks   = math.round((close * trailOffset) / syminfo.mintick)
+
+// Execute trades only if the daily loss circuit breaker is completely safe
+if (buyCondition and strategy.position_size == 0)
+    strategy.entry("Long", strategy.long, qty=contractsToTrade)
+    strategy.exit("Exit Long", "Long", loss=stopLossTicks, trail_points=trailActivationTicks, trail_offset=trailOffsetTicks)
+
+if (sellCondition and strategy.position_size == 0)
+    strategy.entry("Short", strategy.short, qty=contractsToTrade)
+    strategy.exit("Exit Short", "Short", loss=stopLossTicks, trail_points=trailActivationTicks, trail_offset=trailOffsetTicks)
+
+// ==========================================
+//   EMERGENCY CLOSE IF BREACHED MID-TRADE
+// ==========================================
+if (dailyLossBreached)
+    strategy.close_all(comment="EMERGENCY EXIT: Daily Limit Reached")
+    strategy.cancel_all()
