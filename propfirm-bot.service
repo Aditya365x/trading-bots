@@ -1,0 +1,18 @@
+[Unit]
+Description=PropFirm bot (Delta testnet, ETHUSD 2h)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/bot/backtest_adi/tradingApiDeltaDemo
+# loads .env.propfirm itself; -u = unbuffered so logs stream to journalctl
+ExecStart=/home/ubuntu/bot/.venv/bin/python -u bot_propfirm.py --live --loop
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target

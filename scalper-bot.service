@@ -1,0 +1,19 @@
+[Unit]
+Description=Delta 1m scalper bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/bot/backtest_adi/tradingApiDeltaDemo
+# -u = unbuffered so logs show up live in journalctl
+ExecStart=/home/ubuntu/bot/.venv/bin/python -u bot_scalper.py --live --loop
+Restart=always
+RestartSec=10
+# don't hammer Delta if it crash-loops
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target

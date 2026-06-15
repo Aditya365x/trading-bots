@@ -1,0 +1,7 @@
+# install into the project venv:
+#   & "d:\stock Analyser\.venv\Scripts\python.exe" -m pip install -r requirements.txt
+delta-rest-client
+requests
+pandas
+numpy
+python-dotenv
