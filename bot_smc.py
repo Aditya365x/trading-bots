@@ -22,7 +22,7 @@ import time
 from dotenv import load_dotenv
 
 # strategy lives in mtf_backtester (two dirs up, then over)
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "mtf_backtester")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "mtf_backtester")))
 import smc_strategy_adi as smc                       # noqa: E402
 
 from delta_broker import DeltaBroker                 # noqa: E402
